@@ -1,0 +1,10 @@
+node_modules/
+.pnpm/
+*.log
+_last_injection.txt
+_plugin.log
+soul/
+_sync/
+_archive/
+_anchors/
+full/

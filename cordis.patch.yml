@@ -1,0 +1,7 @@
+- insert:
+    - id: deepseek-chat-import
+      name: '@deepseek-ai/dsh-deepseek-chat-import'
+    - id: deepseek-web
+      name: '@xueray/dsh-web-bridge'
+    - id: dsh-soul
+      name: 'dsh-soul-endure-forever'

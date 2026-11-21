@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Soul profiles",
+    "description": "Gives each bound Session its own persona from a Markdown soul profile, matched by Session title."
+  }
+}
