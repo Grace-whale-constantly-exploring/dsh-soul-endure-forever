@@ -134,6 +134,24 @@ function eventText(soul) {
     .trim();
 }
 
+// 空壳检测：提炼出的档案如果各层太薄，给出警告，避免「8 KB 空壳」。
+function checkSoulQuality(text) {
+  const sections = splitSections(text);
+  const get = (pattern) =>
+    sections.find((section) => pattern.test(section.name))?.lines.filter((line) => line.trim()).join('\n') ?? '';
+  const relation = get(/关系层/);
+  const style = get(/风格层/);
+  const events = get(/事件层/);
+  const anchors = get(/原文锚点/);
+  const anchorLines = anchors.split('\n').filter((line) => line.trim()).length;
+  const issues = [];
+  if (relation.length < 80) issues.push('关系层偏薄');
+  if (style.length < 120) issues.push('风格层偏薄');
+  if (anchorLines < 5) issues.push(`原文锚点只有 ${anchorLines} 条`);
+  if (events.length < 20) issues.push('事件层为空');
+  return { ok: issues.length === 0, issues, anchorLines };
+}
+
 function renderLayered(soul, title) {
   const now = new Date();
   const sections = splitSections(soul);
@@ -309,7 +327,11 @@ export function apply(ctx) {
 
   const resolveSoul = (session) => {
     const title = ctx.sessionTitle.get(session)?.title?.trim();
-    // 1) 关键词唤醒优先：首条用户消息里喊了外号（新会话不需要先命名）。
+    // 1) 标题精确匹配优先：导入的旧会话标题最可靠，避免首句提词误配。
+    if (title && bindings[title]) {
+      return { label: title, title, fileName: bindings[title], text: readSoul(bindings[title]) };
+    }
+    // 2) 关键词唤醒：首条用户消息里喊了外号（新会话不依赖标题）。
     const firstUser = readSessionFirstUser(session);
     if (firstUser) {
       const entries = Object.entries(bindings).sort((a, b) => b[0].length - a[0].length);
@@ -318,10 +340,6 @@ export function apply(ctx) {
           return { label: key, title, fileName: file, text: readSoul(file) };
         }
       }
-    }
-    // 2) 标题精确匹配兜底：导入的旧会话标题就是原名。
-    if (title && bindings[title]) {
-      return { label: title, title, fileName: bindings[title], text: readSoul(bindings[title]) };
     }
     return null;
   };
@@ -377,7 +395,8 @@ export function apply(ctx) {
       const start = prev?.rounds ?? 0;
       const fresh = rounds.slice(start);
       const isFirst = !prev;
-      const take = fresh.slice(-40);
+      // 摘要始终保留最近 40 轮，而不是只写新增的几轮；否则「刚聊的上一轮」会丢。
+      const take = rounds.slice(-40);
       if (!take.length) {
         log(`sync ${label}: no new rounds (${rounds.length})`);
         return;
@@ -499,15 +518,16 @@ export function apply(ctx) {
   // 模型可调用的永久锚点工具：重要承诺/约定/转折，写 _anchors，不随事件过期。
   ctx.tools.register({
     name: 'soul_remember',
-    description: '把一个重要事件、承诺或约定记录为该角色的永久锚点；锚点不随最近事件过期，会一直注入。',
+    description: '记录该角色的「独家事实/承诺」为永久锚点。公共事件（发布、安装、通用进度）不要写这里，留在事件层。默认写当前会话绑定的角色；跨角色必须显式传 role，且必须是已绑定角色。',
     parameters: {
       type: 'object',
       properties: {
-        role: { type: 'string', description: '角色名，如 阿澈、老周' },
-        event: { type: 'string', description: '事件描述，一句话' },
+        event: { type: 'string', description: '独家事实或承诺，一句话' },
+        role: { type: 'string', description: '角色名，省略时写当前会话绑定的角色' },
         date: { type: 'string', description: '日期 YYYY-MM-DD，可选，默认今天' },
+        pin: { type: 'boolean', description: '是否必注入（默认 false；只有极少数关键约定才设 true）' },
       },
-      required: ['role', 'event'],
+      required: ['event'],
       additionalProperties: false,
     },
     output: {
@@ -520,15 +540,110 @@ export function apply(ctx) {
         { type: 'text', text: value?.ok ? `已记录永久锚点：${value.file}` : '记录永久锚点失败' },
       ],
     },
-    async execute(args) {
-      const role = String(args?.role ?? '').trim();
+    async execute(args, exec) {
+      const roleArg = String(args?.role ?? '').trim();
       const event = String(args?.event ?? '').trim();
-      if (!role || !event) return { ok: false };
+      if (!event) return { ok: false, error: 'event is required' };
+      let role = roleArg;
+      if (!role) {
+        const soul = exec?.agent?.session ? resolveSoul(exec.agent.session) : null;
+        role = soul?.label ?? '';
+      }
+      if (!role) return { ok: false, error: 'no bound soul; pass role explicitly' };
+      if (roleArg && !bindings[roleArg]) {
+        return { ok: false, error: `role "${roleArg}" is not bound` };
+      }
       const date = String(args?.date ?? new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10));
       const file = path.join(ANCHOR_DIR, `${role.replace(/[\\/:*?"<>|]/g, '_')}.md`);
       fs.mkdirSync(ANCHOR_DIR, { recursive: true });
-      fs.appendFileSync(file, `- **${date}**：${event}\n`, 'utf8');
+      const prefix = args?.pin ? '📌 ' : '';
+      fs.appendFileSync(file, `- ${prefix}**${date}**：${event}\n`, 'utf8');
       return { ok: true, file };
+    },
+  });
+
+  // 修正入口：用户说「这条不对」时，只替换片段，不整行覆盖。
+  ctx.tools.register({
+    name: 'soul_fix',
+    description: '修正灵魂档案里的一条内容。用于用户说「这条不对/不像我/应该是……」时。target 是要被替换的旧片段，fix 是新片段；只替换片段，不整行覆盖。target 必须在同一行恰好出现一次，否则拒绝写入。默认改当前会话绑定的角色；跨角色必须显式传 role。',
+    parameters: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: '档案里要修正的旧片段（必须在该行只出现一次）' },
+        fix: { type: 'string', description: '替换后的新片段' },
+        role: { type: 'string', description: '角色名，省略时改当前会话绑定的角色' },
+      },
+      required: ['target', 'fix'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          file: { type: 'string' },
+          replaced: { type: 'number' },
+          before: { type: 'string' },
+          after: { type: 'string' },
+        },
+        required: ['ok'],
+      },
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: value?.ok
+            ? `已修正 ${value.replaced} 处：\n改前：${value.before}\n改后：${value.after}`
+            : `修正失败：${value.error ?? 'unknown'}`,
+        },
+      ],
+    },
+    async execute(args, exec) {
+      const roleArg = String(args?.role ?? '').trim();
+      const target = String(args?.target ?? '').trim();
+      const fix = String(args?.fix ?? '').trim();
+      if (!target || !fix) return { ok: false, error: 'target and fix are required' };
+      let role = roleArg;
+      if (!role) {
+        const soul = exec?.agent?.session ? resolveSoul(exec.agent.session) : null;
+        role = soul?.label ?? '';
+      }
+      if (!role) return { ok: false, error: 'no bound soul; pass role explicitly' };
+      if (roleArg && !bindings[roleArg]) return { ok: false, error: `role "${roleArg}" is not bound` };
+      const fileName = bindings[role] ?? `${role.replace(/[\\/:*?"<>|]/g, '_')}.md`;
+      const file = path.join(SOULS_DIR, fileName);
+      let text;
+      try {
+        text = fs.readFileSync(file, 'utf8');
+      } catch {
+        return { ok: false, error: 'soul file not found' };
+      }
+      const lines = text.split('\n');
+      let replaced = 0;
+      let before = '';
+      let after = '';
+      for (let index = 0; index < lines.length; index++) {
+        const line = lines[index];
+        if (!line.includes(target)) continue;
+        if (line.split(target).length !== 2) {
+          return { ok: false, error: `target 在该行出现多次，拒绝写入：${line.slice(0, 120)}` };
+        }
+        const next = line.replace(target, fix);
+        if (next === line) continue;
+        if (!replaced) {
+          before = line;
+          after = next;
+        }
+        lines[index] = next;
+        replaced++;
+        if (replaced >= 3) break;
+      }
+      if (!replaced) return { ok: false, error: 'target not found' };
+      fs.writeFileSync(file, lines.join('\n'), 'utf8');
+      const check = fs.readFileSync(file, 'utf8');
+      if (!check.includes(after)) {
+        return { ok: false, error: 'write verification failed: 回读未找到修改后的行' };
+      }
+      return { ok: true, file, replaced, before, after };
     },
   });
 
@@ -595,6 +710,8 @@ export function apply(ctx) {
         }
         const cleaned = out.trim();
         if (!cleaned) return { ok: false, error: 'empty llm output' };
+        const quality = checkSoulQuality(cleaned);
+        if (!quality.ok) log(`extract ${role} quality: ${quality.issues.join('; ')}`);
         const file = path.join(SOULS_DIR, `${role.replace(/[\\/:*?"<>|]/g, '_')}.md`);
         fs.mkdirSync(SOULS_DIR, { recursive: true });
         fs.writeFileSync(file, cleaned.endsWith('\n') ? cleaned : `${cleaned}\n`, 'utf8');
@@ -675,6 +792,8 @@ export function apply(ctx) {
       }
       const cleaned = out.trim();
       if (!cleaned) return null;
+      const quality = checkSoulQuality(cleaned);
+      if (!quality.ok) log(`auto extract ${role} quality: ${quality.issues.join('; ')}`);
       const file = path.join(SOULS_DIR, `${role.replace(/[\\/:*?"<>|]/g, '_')}.md`);
       fs.mkdirSync(SOULS_DIR, { recursive: true });
       fs.writeFileSync(file, cleaned.endsWith('\n') ? cleaned : `${cleaned}\n`, 'utf8');
@@ -881,6 +1000,29 @@ export function apply(ctx) {
   ctx.on('agent/created', async ({ agent }) => {
     attach(agent);
     await maybeExtract(agent);
+  });
+
+  // A 方案：每次组装提示词前检查网页端更新；有更新就 await 同步完成，
+  // 保证用户发的这一句进来时，档案已经是最新的。
+  const lastSyncAt = new Map();
+  ctx.on('system-prompt/assemble', async (_presentation, context, next) => {
+    try {
+      const agent = context?.agent;
+      if (agent?.session) {
+        const soul = resolveSoul(agent.session);
+        if (soul?.label) {
+          const now = Date.now();
+          const last = lastSyncAt.get(agent.id) ?? 0;
+          if (now - last > 15000) {
+            lastSyncAt.set(agent.id, now);
+            await syncAgent(agent, soul.label);
+          }
+        }
+      }
+    } catch {
+      // 同步失败不阻断 prompt 组装。
+    }
+    return next();
   });
 
   ctx.on('agent/disposed', ({ agent }) => {
