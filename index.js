@@ -693,6 +693,17 @@ export function apply(ctx) {
       const hasWeb = list.some((item) => item.title === title);
       if (!hasWeb && !isSeeded) return;
       log(`auto extract start ${title} (web=${hasWeb}, seeded=${isSeeded})`);
+      // 尽量给用户一个可见提示，避免误以为卡死而刷新。
+      try {
+        agent.inject({
+          id: `soul-extract-${Date.now()}`,
+          role: 'user',
+          content: [{ type: 'text', text: '⏳ 正在提炼这份对话的灵魂档案，约需几十秒，请勿刷新。' }],
+          source: { kind: 'system-prompt' },
+        });
+      } catch {
+        // 提示失败不影响提炼。
+      }
       await autoExtract(agent, title);
     } catch (error) {
       log(`maybe extract ${agent.id} failed: ${error}`);
